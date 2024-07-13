@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -93,7 +94,7 @@ type Image struct {
 
 func init() {
 	log = zerolog.New(zerolog.ConsoleWriter{Out: os.Stdout, NoColor: false}).With().Timestamp().Logger()
-	zerolog.SetGlobalLevel(zerolog.TraceLevel)
+	zerolog.SetGlobalLevel(zerolog.DebugLevel)
 	startDatastore()
 	startWorkerPool()
 }
@@ -187,7 +188,16 @@ func (img *Image) Close() error {
 		close(img.fin)
 		closedTwice = nil
 	})
+	img.b = nil
 	return closedTwice
+}
+
+func (img *Image) Read(p []byte) (n int, err error) {
+	n = copy(p, img.PHash)
+	if n != len(img.PHash) {
+		return n, io.ErrShortBuffer
+	}
+	return len(p), nil
 }
 
 func CheckExisting(img *Image, db database.Filer) (ok bool) {
@@ -338,7 +348,9 @@ mainLoop:
 			processed++
 		default:
 			if processed >= len(os.Args)-1 {
-				log.Info().Int("processed", processed).Msg("finished")
+				if processed > 0 {
+					log.Info().Int("processed", processed).Msg("finished")
+				}
 				break mainLoop
 			}
 			time.Sleep(10 * time.Millisecond)
@@ -347,19 +359,77 @@ mainLoop:
 	_ = DB.SyncAll()
 }
 
-func checkAll() {
+func checkAll(maxDistance int) error {
+	var (
+		images     = make(map[string]*goimagehash.ImageHash)
+		dupesFound = make(map[string]struct{})
+	)
+
 	for _, k := range DB.With("images").Keys() {
 		dat, err := DB.With("images").Get(k)
 		if err != nil {
 			log.Fatal().Err(err).Send()
 		}
-		log.Debug().Msgf("%s: %s", string(k), string(dat))
+		log.Trace().Msgf("%s: %s", string(k), string(dat))
+		i := &Image{}
+		if err = sonic.Unmarshal(dat, i); err != nil {
+			return fmt.Errorf("json deserialize fail: %w", err)
+		}
+		dhash, err := goimagehash.LoadImageHash(i)
+		if err != nil {
+			return fmt.Errorf("failed to load image hash for %s: %w", i.Path, err)
+		}
+		images[i.Path] = dhash
 	}
+
+	for k, v := range images {
+		for l, b := range images {
+			if l == k {
+				continue
+			}
+			if _, ok := dupesFound[l]; ok {
+				continue
+			}
+			distance, err := v.Distance(b)
+			if err != nil {
+				return fmt.Errorf("failed to calculate distance between %s and %s: %w", k, l, err)
+			}
+			log.Trace().Msgf("%s vs %s: %d", k, l, distance)
+			if distance < maxDistance {
+				log.Info().Msgf("duplicate found: %s and %s", k, l)
+				dupesFound[k] = struct{}{}
+				dupesFound[l] = struct{}{}
+			}
+		}
+	}
+
+	return nil
 }
 
 func main() {
+	var maxDistance = 12
+	for i, arg := range os.Args {
+		if arg == "-d" && len(os.Args)+1 > i {
+			mdInt, intErr := strconv.Atoi(os.Args[i+1])
+			if intErr != nil {
+				log.Fatal().Err(intErr).Msgf("failed to parse max distance %s", os.Args[i+1])
+			}
+			maxDistance = mdInt
+			os.Args = append(os.Args[:i], os.Args[i+2:]...)
+			continue
+		}
+		if arg == "-v" {
+			zerolog.SetGlobalLevel(zerolog.TraceLevel)
+			os.Args = append(os.Args[:i], os.Args[i+1:]...)
+		}
+	}
 	if len(os.Args) > 0 {
 		processArgs()
 	}
-	checkAll()
+	if err := checkAll(maxDistance); err != nil {
+		log.Fatal().Err(err).Send()
+	}
+	if err := DB.SyncAndCloseAll(); err != nil {
+		log.Fatal().Err(err).Msg("failed to sync and close all databases")
+	}
 }
