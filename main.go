@@ -25,9 +25,8 @@ import (
 	"github.com/bytedance/sonic"
 	"github.com/bytedance/sonic/encoder"
 	"github.com/corona10/goimagehash"
-	"github.com/rs/zerolog"
-
 	"github.com/panjf2000/ants/v2"
+	"github.com/rs/zerolog"
 )
 
 var (
@@ -360,11 +359,32 @@ mainLoop:
 	_ = DB.SyncAll()
 }
 
-func checkAll(maxDistance int) error {
+func checkAll(cfg *config) error {
 	var (
 		images     = make(map[string]*goimagehash.ImageHash)
 		dupesFound = make(map[string]struct{})
 	)
+
+	if cfg.outFile != "" {
+		st, sterr := os.Stat(cfg.outFile)
+		if sterr == nil || !errors.Is(sterr, os.ErrNotExist) {
+			abs, _ := filepath.Abs(cfg.outFile)
+			if sterr == nil {
+				sterr = errors.New("logfile may already exist")
+			}
+			log.Fatal().
+				Str("path", cfg.outFile).
+				Str("path_abs", abs).
+				Interface("stat", st).
+				Err(sterr).Send()
+			return sterr // unreachable
+		}
+
+		var err error
+		if cfg.f, err = os.Create(cfg.outFile); err != nil {
+			log.Fatal().Err(err).Send()
+		}
+	}
 
 	for _, k := range DB.With("images").Keys() {
 		dat, err := DB.With("images").Get(k)
@@ -396,8 +416,13 @@ func checkAll(maxDistance int) error {
 				return fmt.Errorf("failed to calculate distance between %s and %s: %w", k, l, err)
 			}
 			log.Trace().Msgf("%s vs %s: %d", k, l, distance)
-			if distance < maxDistance {
-				log.Info().Msgf("duplicate found: %s and %s", k, l)
+			if distance < cfg.maxDistance && !(cfg.ignoreZero && distance == 0) {
+				log.Info().Int("distance", distance).Msgf("duplicate found: %s and %s", k, l)
+				if cfg.f != nil {
+					if _, err = fmt.Fprintf(cfg.f, "%s\t%s\n", k, l); err != nil {
+						log.Fatal().Err(err).Msg("failed to write to log file")
+					}
+				}
 				dupesFound[k] = struct{}{}
 				dupesFound[l] = struct{}{}
 			}
@@ -416,38 +441,70 @@ func processStdin() []string {
 	return args
 }
 
+type config struct {
+	maxDistance int
+	ignoreZero  bool
+	outFile     string
+	f           *os.File
+}
+
 func main() {
-	var maxDistance = 12
+	var cfg = &config{
+		maxDistance: 12,
+		ignoreZero:  false,
+		outFile:     "dupehunter_" + strconv.Itoa(int(time.Now().UnixMilli())) + ".log",
+	}
+
+	var (
+		osArgs = make([]string, 0, len(os.Args))
+		skOne  = make(chan struct{}, 1)
+	)
+
+	defer close(skOne)
 
 	for i, arg := range os.Args {
+		select {
+		case <-skOne:
+			continue
+		default:
+		}
 		if arg == "-d" && len(os.Args)+1 > i {
 			mdInt, intErr := strconv.Atoi(os.Args[i+1])
 			if intErr != nil {
 				log.Fatal().Err(intErr).Msgf("failed to parse max distance %s", os.Args[i+1])
 			}
-			maxDistance = mdInt
-			os.Args = append(os.Args[:i], os.Args[i+2:]...)
+			cfg.maxDistance = mdInt
+			skOne <- struct{}{}
 			continue
 		}
 		if arg == "-v" {
 			zerolog.SetGlobalLevel(zerolog.TraceLevel)
-			os.Args = append(os.Args[:i], os.Args[i+1:]...)
+			continue
 		}
+		if arg == "--ignore-zero" {
+			cfg.ignoreZero = true
+			continue
+		}
+		osArgs = append(osArgs, arg)
 	}
 
-	if len(os.Args) == 2 && os.Args[1] == "-" {
+	if len(osArgs) == 2 && os.Args[1] == "-" {
 		processArgs(processStdin())
 	}
 
-	if len(os.Args) > 0 {
-		processArgs(os.Args)
+	if len(osArgs) > 0 {
+		processArgs(osArgs)
 	}
 
-	if err := checkAll(maxDistance); err != nil {
+	if err := checkAll(cfg); err != nil {
 		log.Fatal().Err(err).Send()
 	}
 
 	if err := DB.SyncAndCloseAll(); err != nil {
 		log.Fatal().Err(err).Msg("failed to sync and close all databases")
+	}
+	if cfg.f != nil {
+		_ = cfg.f.Sync()
+		_ = cfg.f.Close()
 	}
 }
