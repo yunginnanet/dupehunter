@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"errors"
 	"fmt"
@@ -332,10 +333,10 @@ func process(filePath string, finChan chan struct{}) {
 	}
 }
 
-func processArgs() {
+func processArgs(args []string) {
 	var processed = 0
 	var finChan = make(chan struct{})
-	for i, arg := range os.Args {
+	for i, arg := range args {
 		if i == 0 {
 			continue
 		}
@@ -347,7 +348,7 @@ mainLoop:
 		case <-finChan:
 			processed++
 		default:
-			if processed >= len(os.Args)-1 {
+			if processed >= len(args)-1 {
 				if processed > 0 {
 					log.Info().Int("processed", processed).Msg("finished")
 				}
@@ -406,8 +407,18 @@ func checkAll(maxDistance int) error {
 	return nil
 }
 
+func processStdin() []string {
+	var args = make([]string, 0)
+	bufIn := bufio.NewScanner(os.Stdin)
+	for bufIn.Scan() {
+		args = append(args, bufIn.Text())
+	}
+	return args
+}
+
 func main() {
 	var maxDistance = 12
+
 	for i, arg := range os.Args {
 		if arg == "-d" && len(os.Args)+1 > i {
 			mdInt, intErr := strconv.Atoi(os.Args[i+1])
@@ -423,12 +434,19 @@ func main() {
 			os.Args = append(os.Args[:i], os.Args[i+1:]...)
 		}
 	}
-	if len(os.Args) > 0 {
-		processArgs()
+
+	if len(os.Args) == 2 && os.Args[1] == "-" {
+		processArgs(processStdin())
 	}
+
+	if len(os.Args) > 0 {
+		processArgs(os.Args)
+	}
+
 	if err := checkAll(maxDistance); err != nil {
 		log.Fatal().Err(err).Send()
 	}
+
 	if err := DB.SyncAndCloseAll(); err != nil {
 		log.Fatal().Err(err).Msg("failed to sync and close all databases")
 	}
